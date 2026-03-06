@@ -4,9 +4,12 @@
 package resource
 
 import (
+	"bytes"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
+	"unicode"
 
 	"sigs.k8s.io/kustomize/api/filters/patchstrategicmerge"
 	"sigs.k8s.io/kustomize/api/ifc"
@@ -380,11 +383,120 @@ func (r *Resource) String() string {
 // AsYAML returns the resource in Yaml form.
 // Easier to read than JSON.
 func (r *Resource) AsYAML() ([]byte, error) {
-	json, err := r.MarshalJSON()
+	j, err := r.MarshalJSON()
 	if err != nil {
 		return nil, err
 	}
-	return yaml.JSONToYAML(json)
+	return jsonToYAML(j)
+}
+
+// jsonToYAML converts JSON to YAML using go-yaml v3's node tree.
+// This replaces sigs.k8s.io/yaml.JSONToYAML which uses go-yaml v2 and
+// has non-deterministic sorting for certain map keys (e.g. hex strings
+// that go-yaml v2 interprets as integers).
+func jsonToYAML(j []byte) ([]byte, error) {
+	var node kyaml.Node
+	if err := kyaml.Unmarshal(j, &node); err != nil {
+		return nil, err
+	}
+	prepareNode(&node)
+	var buf bytes.Buffer
+	enc := kyaml.NewEncoder(&buf)
+	if err := enc.Encode(&node); err != nil {
+		return nil, err
+	}
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// prepareNode converts a JSON-parsed yaml.Node tree into block-style YAML,
+// sorts mapping keys alphabetically, and preserves string quoting for
+// values that could be misinterpreted as non-string YAML types.
+func prepareNode(node *kyaml.Node) {
+	switch node.Kind {
+	case kyaml.MappingNode:
+		node.Style = 0
+		sortMappingKeys(node)
+	case kyaml.SequenceNode:
+		node.Style = 0
+	case kyaml.ScalarNode:
+		// Clear flow style but keep the tag so values like "false",
+		// "true", "null", and numbers remain properly quoted as strings.
+		node.Style = 0
+	}
+	for _, c := range node.Content {
+		prepareNode(c)
+	}
+}
+
+// sortMappingKeys sorts the key-value pairs in a MappingNode using the same
+// ordering as go-yaml v2. MappingNode content is [key1, val1, key2, val2, ...].
+func sortMappingKeys(node *kyaml.Node) {
+	n := len(node.Content) / 2
+	if n <= 1 {
+		return
+	}
+	pairs := make([]int, n)
+	for i := range pairs {
+		pairs[i] = i
+	}
+	sort.SliceStable(pairs, func(i, j int) bool {
+		return yamlKeyLess(node.Content[pairs[i]*2].Value, node.Content[pairs[j]*2].Value)
+	})
+	sorted := make([]*kyaml.Node, len(node.Content))
+	for i, p := range pairs {
+		sorted[i*2] = node.Content[p*2]
+		sorted[i*2+1] = node.Content[p*2+1]
+	}
+	node.Content = sorted
+}
+
+// yamlKeyLess replicates go-yaml v2's key sorting for strings.
+// It uses a natural sort where letters are compared directly,
+// non-letter characters sort before letters, and embedded digit
+// sequences are compared numerically.
+func yamlKeyLess(a, b string) bool {
+	ar, br := []rune(a), []rune(b)
+	for i := 0; i < len(ar) && i < len(br); i++ {
+		if ar[i] == br[i] {
+			continue
+		}
+		al := unicode.IsLetter(ar[i])
+		bl := unicode.IsLetter(br[i])
+		if al && bl {
+			return ar[i] < br[i]
+		}
+		if al || bl {
+			return bl
+		}
+		var ai, bi int
+		var an, bn int64
+		if ar[i] == '0' || br[i] == '0' {
+			for j := i - 1; j >= 0 && unicode.IsDigit(ar[j]); j-- {
+				if ar[j] != '0' {
+					an = 1
+					bn = 1
+					break
+				}
+			}
+		}
+		for ai = i; ai < len(ar) && unicode.IsDigit(ar[ai]); ai++ {
+			an = an*10 + int64(ar[ai]-'0')
+		}
+		for bi = i; bi < len(br) && unicode.IsDigit(br[bi]); bi++ {
+			bn = bn*10 + int64(br[bi]-'0')
+		}
+		if an != bn {
+			return an < bn
+		}
+		if ai != bi {
+			return ai < bi
+		}
+		return ar[i] < br[i]
+	}
+	return len(ar) < len(br)
 }
 
 // MustYaml returns YAML or panics.
